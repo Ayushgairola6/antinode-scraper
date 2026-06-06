@@ -194,7 +194,7 @@ async function scrapeStatic(url, queryEmbedding, turndown) {
 // Main search endpoint (returns original dataset array)
 // ------------------------------------------------------------------
 app.post("/api/search", async (req, res) => {
-    const { source, prompt, user_id, message_id } = req.body;
+    const { source, prompt, user_id, message_id, webhook_url } = req.body;
 
     if (!source || !prompt) {
         return res.status(400).json({ error: "Missing 'source' (links) or 'prompt'." });
@@ -214,6 +214,10 @@ app.post("/api/search", async (req, res) => {
             return res.status(500).json({ error: "Failed to embed query." });
         }
 
+
+        if (userId) {
+            await SendWebhook("Embedded you search query", "GENERATED_EMBEDDINGS", userId, messageId, webhook_url);
+        }
         const turndown = new TurndownService({ headingStyle: "atx" });
         turndown.remove(["img", "iframe", "script", "style", "noscript", "svg", "form"]);
 
@@ -224,6 +228,9 @@ app.post("/api/search", async (req, res) => {
             let result = await scrapeStatic(url, queryEmbedding, turndown);
             if (!result) {
                 // Fallback to Playwright
+                if (userId) {
+                    await SendWebhook("I am trying to read the contents of the this web-page", "DIVING_DEEP", userId, messageId, webhook_url);
+                }
                 console.log(`Falling back to Playwright for ${url}`);
                 const crawler = await getPlaywrightCrawler();
                 // Run crawler for this single URL
@@ -236,13 +243,13 @@ app.post("/api/search", async (req, res) => {
             if (result) {
                 dataset.push(result);
                 if (userId) {
-                    await SendWebhook(result.markdown.slice(0, 500), "PAGE_READ", userId, messageId);
+                    await SendWebhook(result.markdown.slice(0, 500), "PAGE_READ", userId, messageId, webhook_url);
                 }
             }
         }
 
         if (userId) {
-            SendWebhook("no_link", "SCRAPE_COMPLETE", userId, messageId).catch(() => { });
+            SendWebhook("no_link", "SCRAPE_COMPLETE", userId, messageId, webhook_url);
         }
 
         // ✅ Original response format: return dataset array directly
@@ -250,7 +257,7 @@ app.post("/api/search", async (req, res) => {
     } catch (error) {
         console.error("Pipeline Error:", error);
         if (userId) {
-            await SendWebhook("no_link", "ERROR_OCCURRED", userId, messageId);
+            await SendWebhook("no_link", "ERROR_OCCURRED", userId, messageId, webhook_url);
         }
         return res.status(500).json({
             error: "Scraping failed",

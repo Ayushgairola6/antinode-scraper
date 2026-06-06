@@ -57,12 +57,15 @@ export async function EmbedChunk(chunk) {
 /**
  * Send a webhook event. Does nothing if `user_id` is missing.
  */
-export async function SendWebhook(link, message, user_id, MessageId) {
-    if (!user_id) return;                         // ← skip for public users
+export async function SendWebhook(link, message, user_id, MessageId, WEBHOOK_URL) {
+    if (!user_id || !WEBHOOK_URL) {
+        console.log('user_id or webhook_url was missingin the web hooksending function', user_id, WEBHOOK_URL)
+        return
+    };                         // ← skip for public users
+    console.log("webhook emitted")
 
     try {
-        const url =
-            process.env.WEBHOOK_URL || "https://api.antinodeai.space/source/read/apify";
+        const url = WEBHOOK_URL
 
         await fetch(url, {
             method: "POST",

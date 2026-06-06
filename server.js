@@ -1,5 +1,3 @@
-
-
 import express from "express";
 import axios from "axios";
 import * as cheerio from "cheerio";
@@ -14,10 +12,27 @@ const app = express();
 app.use(express.json());
 
 // ------------------------------------------------------------------
-// Global persistent Playwright instance (reused across all requests)
+// Helpers
+// ------------------------------------------------------------------
+function cosineSimilarity(vecA, vecB) {
+    let dot = 0, normA = 0, normB = 0;
+    for (let i = 0; i < vecA.length; i++) {
+        dot += vecA[i] * vecB[i];
+        normA += vecA[i] * vecA[i];
+        normB += vecB[i] * vecB[i];
+    }
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+// ------------------------------------------------------------------
+// Health check
+// ------------------------------------------------------------------
+app.get("/", (req, res) => res.send("Antinode Scrape API is live 🚀 (Hybrid)"));
+
+// ------------------------------------------------------------------
+// Persistent Playwright crawler (reused across requests)
 // ------------------------------------------------------------------
 let playwrightCrawler = null;
-let isCrawlerReady = false;
 
 async function getPlaywrightCrawler() {
     if (!playwrightCrawler) {
@@ -37,7 +52,7 @@ async function getPlaywrightCrawler() {
                 },
             },
             minConcurrency: 1,
-            maxConcurrency: 2,       // conservative for Render free tier
+            maxConcurrency: 2,
             maxRequestRetries: 1,
             requestHandlerTimeoutSecs: 90,
             preNavigationHooks: [
@@ -46,62 +61,28 @@ async function getPlaywrightCrawler() {
                 },
             ],
             async requestHandler({ request, page }) {
-                const url = request.url;
-                const hostname = new URL(url).hostname;
                 const html = await page.content();
-                // processPageContent is defined later; we'll pass it as a closure
-                return { html, url, hostname };
+                return { html, url: request.url, hostname: new URL(request.url).hostname };
             },
         }, new Configuration({
             persistStorage: false,
             storageClient: new MemoryStorage({ persistStorage: false }),
         }));
-
-        // Warm up the browser
+        // Warm up
         await playwrightCrawler.run(['https://example.com']).catch(() => { });
-        isCrawlerReady = true;
-        console.log("Playwright browser warmed up");
+        console.log("Playwright crawler ready");
     }
     return playwrightCrawler;
 }
 
 // ------------------------------------------------------------------
-// Helper: Extract content using Cheerio (static)
-// ------------------------------------------------------------------
-async function scrapeStatic(url, queryEmbedding, turndown) {
-    try {
-        const response = await axios.get(url, {
-            timeout: 15000,
-            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AntinodeBot/1.0)' }
-        });
-        const html = response.data;
-        const $ = cheerio.load(html);
-        // Remove noise
-        $('script, style, nav, footer, header, aside').remove();
-        const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
-
-        // Heuristics: React root or too little text -> likely dynamic
-        const hasReactRoot = $('#root, #__next, [data-reactroot]').length > 0;
-        if (hasReactRoot && bodyText.length < 2000) return null;
-        if (bodyText.length < 500) return null;
-
-        const hostname = new URL(url).hostname;
-        // Use the same processPageContent but without JSDOM? Actually we still need to extract article.
-        // We'll reuse processPageContent with the static HTML
-        return await processPageContent({ html, url, hostname, queryEmbedding, turndown });
-    } catch (err) {
-        console.warn(`Static scrape failed for ${url}: ${err.message}`);
-        return null;
-    }
-}
-
-// ------------------------------------------------------------------
-// Shared content extraction (works for both static and dynamic)
+// Shared content processor (returns same structure as original)
 // ------------------------------------------------------------------
 async function processPageContent({ html, url, hostname, queryEmbedding, turndown }) {
     const dom = new JSDOM(html, { url });
     const document = dom.window.document;
 
+    // Remove noise
     const NOISE_SELECTORS = [
         "header", "footer", "nav", "aside", ".sidebar",
         "dialog", '[role="dialog"]', '[aria-modal="true"]',
@@ -114,6 +95,7 @@ async function processPageContent({ html, url, hostname, queryEmbedding, turndow
 
     const reader = new Readability(document);
     const article = reader.parse();
+
     let markdown = "";
     if (article?.content) {
         markdown = turndown.turndown(article.content);
@@ -129,7 +111,7 @@ async function processPageContent({ html, url, hostname, queryEmbedding, turndow
     if (cleanedText.length < 200) return null;
 
     const chunks = await CreateChunks(cleanedText);
-    if (!chunks.length) return null;
+    if (!chunks || !chunks.length) return null;
 
     // Embed chunks
     const allEmbeddings = [];
@@ -137,8 +119,9 @@ async function processPageContent({ html, url, hostname, queryEmbedding, turndow
     for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
         const batch = chunks.slice(i, i + BATCH_SIZE);
         const batchEmb = await EmbedChunk(batch);
-        allEmbeddings.push(...batchEmb);
+        if (batchEmb && batchEmb.length) allEmbeddings.push(...batchEmb);
     }
+    if (allEmbeddings.length !== chunks.length) return null;
 
     const scoredChunks = chunks.map((chunk, idx) => ({
         idx,
@@ -183,23 +166,38 @@ async function processPageContent({ html, url, hostname, queryEmbedding, turndow
     };
 }
 
-function cosineSimilarity(vecA, vecB) {
-    let dot = 0, normA = 0, normB = 0;
-    for (let i = 0; i < vecA.length; i++) {
-        dot += vecA[i] * vecB[i];
-        normA += vecA[i] * vecA[i];
-        normB += vecB[i] * vecB[i];
+// ------------------------------------------------------------------
+// Static scraper with Cheerio (fast path)
+// ------------------------------------------------------------------
+async function scrapeStatic(url, queryEmbedding, turndown) {
+    try {
+        const response = await axios.get(url, {
+            timeout: 15000,
+            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AntinodeBot/1.0)' }
+        });
+        const html = response.data;
+        const $ = cheerio.load(html);
+        $('script, style, nav, footer, header, aside').remove();
+        const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
+        const hasReactRoot = $('#root, #__next, [data-reactroot]').length > 0;
+        if (hasReactRoot && bodyText.length < 2000) return null;
+        if (bodyText.length < 500) return null;
+        const hostname = new URL(url).hostname;
+        return await processPageContent({ html, url, hostname, queryEmbedding, turndown });
+    } catch (err) {
+        console.warn(`Static scrape failed for ${url}: ${err.message}`);
+        return null;
     }
-    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 // ------------------------------------------------------------------
-// Main endpoint
+// Main search endpoint (returns original dataset array)
 // ------------------------------------------------------------------
 app.post("/api/search", async (req, res) => {
     const { source, prompt, user_id, message_id } = req.body;
+
     if (!source || !prompt) {
-        return res.status(400).json({ error: "Missing 'source' or 'prompt'." });
+        return res.status(400).json({ error: "Missing 'source' (links) or 'prompt'." });
     }
 
     const links = Array.isArray(source) ? source : [source];
@@ -219,32 +217,26 @@ app.post("/api/search", async (req, res) => {
         const turndown = new TurndownService({ headingStyle: "atx" });
         turndown.remove(["img", "iframe", "script", "style", "noscript", "svg", "form"]);
 
-        const results = [];
+        const dataset = [];
 
-        // Process each URL: try static first, fallback to Playwright
         for (const url of links) {
+            // Try static first
             let result = await scrapeStatic(url, queryEmbedding, turndown);
-            if (result) {
-                results.push(result);
-                if (userId) await SendWebhook(result.markdown.slice(0, 500), "PAGE_READ", userId, messageId);
-                continue;
+            if (!result) {
+                // Fallback to Playwright
+                console.log(`Falling back to Playwright for ${url}`);
+                const crawler = await getPlaywrightCrawler();
+                // Run crawler for this single URL
+                const results = await crawler.run([url]);
+                if (results && results.length > 0) {
+                    const { html, url: resultUrl, hostname } = results[0];
+                    result = await processPageContent({ html, url: resultUrl, hostname, queryEmbedding, turndown });
+                }
             }
-
-            // Fallback to Playwright (dynamic)
-            console.log(`Falling back to Playwright for ${url}`);
-            const crawler = await getPlaywrightCrawler();
-            const [crawlResult] = await crawler.run([url]);
-            if (crawlResult) {
-                const processed = await processPageContent({
-                    html: crawlResult.html,
-                    url: crawlResult.url,
-                    hostname: crawlResult.hostname,
-                    queryEmbedding,
-                    turndown
-                });
-                if (processed) {
-                    results.push(processed);
-                    if (userId) await SendWebhook(processed.markdown.slice(0, 500), "PAGE_READ", userId, messageId);
+            if (result) {
+                dataset.push(result);
+                if (userId) {
+                    await SendWebhook(result.markdown.slice(0, 500), "PAGE_READ", userId, messageId);
                 }
             }
         }
@@ -252,11 +244,18 @@ app.post("/api/search", async (req, res) => {
         if (userId) {
             SendWebhook("no_link", "SCRAPE_COMPLETE", userId, messageId).catch(() => { });
         }
-        return res.status(200).json(results);
+
+        // ✅ Original response format: return dataset array directly
+        return res.status(200).json(dataset);
     } catch (error) {
         console.error("Pipeline Error:", error);
-        if (userId) await SendWebhook("no_link", "ERROR_OCCURRED", userId, messageId);
-        return res.status(500).json({ error: "Scraping failed", details: error.message });
+        if (userId) {
+            await SendWebhook("no_link", "ERROR_OCCURRED", userId, messageId);
+        }
+        return res.status(500).json({
+            error: "Scraping failed",
+            details: error.message,
+        });
     }
 });
 

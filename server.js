@@ -268,25 +268,31 @@ app.get("/", (req, res) => res.send("Antinode Scrape API is live 🚀 (Lightpand
 // ------------------------------------------------------------------
 // Persistent Lightpanda CDP server + Playwright‑Core connection
 // ------------------------------------------------------------------
-let lightpandaProcess = null;
+let lightpandaProc = null;
 let persistentBrowser = null;
 
 async function getBrowser() {
     if (!persistentBrowser) {
-        // Connect to Lightpanda's CDP server using the internal service name
-        const lightpandaHost = process.env.LIGHTPANDA_HOST || 'http://lightpanda-service-name:9222';
-        console.log(`Connecting to Lightpanda at ${lightpandaHost}`);
-        persistentBrowser = await chromium.connectOverCDP(lightpandaHost);
+        console.log("Starting Lightpanda CDP server...");
+        // Launch Lightpanda on a random available port
+        const { port, proc } = await lightpanda.serve({ port: 0 });
+        lightpandaProc = proc;
+        console.log(`Lightpanda CDP server running on port ${port}`);
+
+        // Connect Playwright‑Core to Lightpanda's WebSocket endpoint
+        const wsEndpoint = `ws://127.0.0.1:${port}`;
+        persistentBrowser = await chromium.connectOverCDP(wsEndpoint);
         console.log("Connected to Lightpanda via CDP");
 
-        // Warm up the connection
+        // Warm up: create a page and close it
         const page = await persistentBrowser.newPage();
         await page.goto('https://example.com', { waitUntil: 'domcontentloaded' });
         await page.close();
-        console.log("Lightpanda browser ready");
+        console.log("Lightpanda browser ready (warmed up)");
     }
     return persistentBrowser;
 }
+
 // ------------------------------------------------------------------
 // Content processor (completely unchanged)
 // ------------------------------------------------------------------

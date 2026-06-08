@@ -1,7 +1,4 @@
 import express from "express";
-import axios from "axios";
-import * as cheerio from "cheerio";
-import { PlaywrightCrawler, Configuration, MemoryStorage, log } from "crawlee";
 import { chromium } from "playwright";
 import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
@@ -27,62 +24,42 @@ function cosineSimilarity(vecA, vecB) {
 // ------------------------------------------------------------------
 // Health check
 // ------------------------------------------------------------------
-app.get("/", (req, res) => res.send("Antinode Scrape API is live 🚀 (Hybrid)"));
+app.get("/", (req, res) => res.send("Antinode Scrape API is live 🚀 (Playwright)"));
 
 // ------------------------------------------------------------------
-// Persistent Playwright crawler (reused across requests)
+// Persistent browser (reused across all requests)
 // ------------------------------------------------------------------
-let playwrightCrawler = null;
+let persistentBrowser = null;
 
-async function getPlaywrightCrawler() {
-    if (!playwrightCrawler) {
-        log.setLevel(log.LEVELS.OFF);
-        playwrightCrawler = new PlaywrightCrawler({
-            launchContext: {
-                launcher: chromium,
-                launchOptions: {
-                    headless: true,
-                    args: [
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-accelerated-2d-canvas',
-                        '--disable-gpu',
-                    ],
-                },
-            },
-            minConcurrency: 1,
-            maxConcurrency: 2,
-            maxRequestRetries: 1,
-            requestHandlerTimeoutSecs: 90,
-            preNavigationHooks: [
-                async ({ page }) => {
-                    await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { });
-                },
+async function getBrowser() {
+    if (!persistentBrowser) {
+        console.log("Launching persistent Playwright browser...");
+        persistentBrowser = await chromium.launch({
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
             ],
-            async requestHandler({ request, page }) {
-                const html = await page.content();
-                return { html, url: request.url, hostname: new URL(request.url).hostname };
-            },
-        }, new Configuration({
-            persistStorage: false,
-            storageClient: new MemoryStorage({ persistStorage: false }),
-        }));
+        });
         // Warm up
-        await playwrightCrawler.run(['https://example.com']).catch(() => { });
-        console.log("Playwright crawler ready");
+        const page = await persistentBrowser.newPage();
+        await page.goto('https://example.com', { waitUntil: 'domcontentloaded' });
+        await page.close();
+        console.log("Playwright browser ready");
     }
-    return playwrightCrawler;
+    return persistentBrowser;
 }
 
 // ------------------------------------------------------------------
-// Shared content processor (returns same structure as original)
+// Content processor (unchanged)
 // ------------------------------------------------------------------
 async function processPageContent({ html, url, hostname, queryEmbedding, turndown }) {
     const dom = new JSDOM(html, { url });
     const document = dom.window.document;
 
-    // Remove noise
     const NOISE_SELECTORS = [
         "header", "footer", "nav", "aside", ".sidebar",
         "dialog", '[role="dialog"]', '[aria-modal="true"]',
@@ -113,7 +90,6 @@ async function processPageContent({ html, url, hostname, queryEmbedding, turndow
     const chunks = await CreateChunks(cleanedText);
     if (!chunks || !chunks.length) return null;
 
-    // Embed chunks
     const allEmbeddings = [];
     const BATCH_SIZE = 12;
     for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
@@ -132,7 +108,6 @@ async function processPageContent({ html, url, hostname, queryEmbedding, turndow
     const relevant = scoredChunks.filter(item => item.score >= 0.35).sort((a, b) => b.score - a.score);
     if (!relevant.length) return null;
 
-    // Build context
     const selectedIndices = new Set();
     let currentLength = 0;
     const MAX_CONTEXT_LEN = 15000;
@@ -167,37 +142,33 @@ async function processPageContent({ html, url, hostname, queryEmbedding, turndow
 }
 
 // ------------------------------------------------------------------
-// Static scraper with Cheerio (fast path)
+// Scrape a single URL (Playwright only)
 // ------------------------------------------------------------------
-async function scrapeStatic(url, queryEmbedding, turndown) {
+async function scrapeUrl(url, queryEmbedding, turndown) {
+    const browser = await getBrowser();
+    let page = null;
     try {
-        const response = await axios.get(url, {
-            timeout: 15000,
-            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AntinodeBot/1.0)' }
-        });
-        const html = response.data;
-        const $ = cheerio.load(html);
-        $('script, style, nav, footer, header, aside').remove();
-        const bodyText = $('body').text().replace(/\s+/g, ' ').trim();
-        const hasReactRoot = $('#root, #__next, [data-reactroot]').length > 0;
-        if (hasReactRoot && bodyText.length < 2000) return null;
-        if (bodyText.length < 500) return null;
+        page = await browser.newPage();
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        const html = await page.content();
         const hostname = new URL(url).hostname;
         return await processPageContent({ html, url, hostname, queryEmbedding, turndown });
     } catch (err) {
-        console.warn(`Static scrape failed for ${url}: ${err.message}`);
+        console.error(`Scrape failed for ${url}:`, err.message);
         return null;
+    } finally {
+        if (page) await page.close().catch(() => { });
     }
 }
 
 // ------------------------------------------------------------------
-// Main search endpoint (returns original dataset array)
+// Main endpoint
 // ------------------------------------------------------------------
 app.post("/api/search", async (req, res) => {
     const { source, prompt, user_id, message_id, webhook_url } = req.body;
 
     if (!source || !prompt) {
-        return res.status(400).json({ error: "Missing 'source' (links) or 'prompt'." });
+        return res.status(400).json({ error: "Missing 'source' or 'prompt'." });
     }
 
     const links = Array.isArray(source) ? source : [source];
@@ -214,32 +185,21 @@ app.post("/api/search", async (req, res) => {
             return res.status(500).json({ error: "Failed to embed query." });
         }
 
-
         if (userId) {
-            await SendWebhook("Embedded you search query", "GENERATED_EMBEDDINGS", userId, messageId, webhook_url);
+            await SendWebhook("Embedded your search query", "GENERATED_EMBEDDINGS", userId, messageId, webhook_url);
         }
+
         const turndown = new TurndownService({ headingStyle: "atx" });
         turndown.remove(["img", "iframe", "script", "style", "noscript", "svg", "form"]);
 
         const dataset = [];
 
+        // Process URLs sequentially (add concurrency if needed)
         for (const url of links) {
-            // Try static first
-            let result = await scrapeStatic(url, queryEmbedding, turndown);
-            if (!result) {
-                // Fallback to Playwright
-                if (userId) {
-                    await SendWebhook("I am trying to read the contents of the this web-page", "DIVING_DEEP", userId, messageId, webhook_url);
-                }
-                console.log(`Falling back to Playwright for ${url}`);
-                const crawler = await getPlaywrightCrawler();
-                // Run crawler for this single URL
-                const results = await crawler.run([url]);
-                if (results && results.length > 0) {
-                    const { html, url: resultUrl, hostname } = results[0];
-                    result = await processPageContent({ html, url: resultUrl, hostname, queryEmbedding, turndown });
-                }
+            if (userId) {
+                await SendWebhook(`Scraping: ${url}`, "FETCHING_URL", userId, messageId, webhook_url);
             }
+            const result = await scrapeUrl(url, queryEmbedding, turndown);
             if (result) {
                 dataset.push(result);
                 if (userId) {
@@ -249,10 +209,9 @@ app.post("/api/search", async (req, res) => {
         }
 
         if (userId) {
-            SendWebhook("no_link", "SCRAPE_COMPLETE", userId, messageId, webhook_url);
+            await SendWebhook("no_link", "SCRAPE_COMPLETE", userId, messageId, webhook_url);
         }
 
-        // ✅ Original response format: return dataset array directly
         return res.status(200).json(dataset);
     } catch (error) {
         console.error("Pipeline Error:", error);
@@ -270,6 +229,8 @@ app.post("/api/search", async (req, res) => {
 // Start server
 // ------------------------------------------------------------------
 const PORT = process.env.PORT || 7860;
-app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Hybrid scraper running on port ${PORT} (static first, persistent Playwright)`);
+app.listen(PORT, "0.0.0.0", async () => {
+    // Pre-warm the browser
+    await getBrowser();
+    console.log(`🚀 Playwright-only scraper running on port ${PORT} (persistent browser)`);
 });

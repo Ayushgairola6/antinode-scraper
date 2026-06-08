@@ -273,27 +273,20 @@ let persistentBrowser = null;
 
 async function getBrowser() {
     if (!persistentBrowser) {
-        console.log("Starting Lightpanda CDP server...");
-        // Launch Lightpanda's built‑in CDP server on a random port
-        const serveOptions = { port: 0 }; // 0 = pick any free port
-        const { port, proc } = await lightpanda.serve(serveOptions);
-        lightpandaProcess = proc;
-        console.log(`Lightpanda CDP server running on port ${port}`);
-
-        // Connect Playwright‑Core to Lightpanda's WebSocket endpoint
-        const wsEndpoint = `ws://127.0.0.1:${port}`;
-        persistentBrowser = await chromium.connectOverCDP(wsEndpoint);
+        // Connect to Lightpanda's CDP server using the internal service name
+        const lightpandaHost = process.env.LIGHTPANDA_HOST || 'http://lightpanda-service-name:9222';
+        console.log(`Connecting to Lightpanda at ${lightpandaHost}`);
+        persistentBrowser = await chromium.connectOverCDP(lightpandaHost);
         console.log("Connected to Lightpanda via CDP");
 
-        // Warm up: create a page and close it (ensures everything works)
+        // Warm up the connection
         const page = await persistentBrowser.newPage();
         await page.goto('https://example.com', { waitUntil: 'domcontentloaded' });
         await page.close();
-        console.log("Lightpanda browser ready (warmed up)");
+        console.log("Lightpanda browser ready");
     }
     return persistentBrowser;
 }
-
 // ------------------------------------------------------------------
 // Content processor (completely unchanged)
 // ------------------------------------------------------------------

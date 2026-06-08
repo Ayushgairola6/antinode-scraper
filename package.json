@@ -3,9 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "prestart": "npx playwright install chromium",
-    "start": "node server.js",
-    "postinstall": "npx playwright install chromium"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",

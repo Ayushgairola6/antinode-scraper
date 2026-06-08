@@ -485,9 +485,9 @@
 import express from "express";
 import { exec } from "child_process";
 import { promisify } from "util";
-import TurndownService from "turndown";
-import { Readability } from "@mozilla/readability";
-import { JSDOM } from "jsdom";
+// import TurndownService from "turndown";
+// import { Readability } from "@mozilla/readability";
+// import { JSDOM } from "jsdom";
 import { EmbedQuery, EmbedChunk, CreateChunks, SendWebhook } from "./utils.js";
 
 const execAsync = promisify(exec);

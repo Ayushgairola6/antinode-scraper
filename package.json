@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "postinstall": "curl -L -o ./lightpanda https://github.com/lightpanda-io/browser/releases/download/nightly/lightpanda-x86_64-linux && chmod +x ./lightpanda",
+    "postinstall": "npx playwright install chromium",
     "start": "node server.js"
   },
   "dependencies": {
@@ -11,7 +11,8 @@
     "@langchain/textsplitters": "^1.0.1",
     "@langchain/core": "^1.0.0",
     "dotenv": "^16.4.5",
-    "p-limit": "^4.0.0"
+    "p-limit": "^4.0.0",
+    "playwright": "^1.48.0"
   },
   "engines": {
     "node": ">=20.0.0"

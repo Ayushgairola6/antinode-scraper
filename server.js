@@ -1,10 +1,9 @@
 import express from "express";
-import { exec } from "child_process";
-import { promisify } from "util";
+import { chromium } from "playwright";
 import pLimit from "p-limit";
 import { EmbedQuery, EmbedChunk, CreateChunks, SendWebhook } from "./utils.js";
+import { URL } from "url";
 
-const execAsync = promisify(exec);
 const app = express();
 app.use(express.json());
 
@@ -21,13 +20,127 @@ function cosineSimilarity(vecA, vecB) {
     return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-// ------------------------------------------------------------------
-// Health check
-// ------------------------------------------------------------------
-app.get("/", (req, res) => res.send("Antinode Scrape API is live 🚀 (Lightpanda fetch + concurrency)"));
+function isSafeUrl(urlString) {
+    try {
+        const url = new URL(urlString);
+        if (!["http:", "https:"].includes(url.protocol)) return false;
+        const hostname = url.hostname.toLowerCase();
+        const blocked = [
+            "localhost", "127.0.0.1", "0.0.0.0",
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+            "169.254.0.0/16", "::1"
+        ];
+        if (blocked.some(b => hostname === b || hostname.endsWith(`.${b}`))) return false;
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 // ------------------------------------------------------------------
-// Process markdown from Lightpanda (chunking + embedding)
+// Global Playwright browser with aggressive launch args to avoid Skia crash
+// ------------------------------------------------------------------
+let browser = null;
+let browserPromise = null;
+
+async function getBrowser() {
+    if (browser && browser.isConnected()) return browser;
+    if (browserPromise) return browserPromise;
+
+    browserPromise = (async () => {
+        console.log("Launching Playwright browser (aggressive mode)");
+        const newBrowser = await chromium.launch({
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-gpu',                      // avoid GPU crashes
+                '--disable-software-rasterizer',
+                '--disable-dev-shm-usage',            // avoid /dev/shm issues
+                '--disable-font-subpixel-positioning', // workaround for Skia error
+                '--disable-logging',
+                '--disable-breakpad',
+                '--disable-crash-reporter',
+                '--disable-features=LayoutNG,NetworkService,ShadowDomV0',
+                '--disable-blink-features=AutomationControlled',
+            ],
+            env: {
+                ...process.env,
+                // Force disable fontconfig to avoid missing fonts crash
+                FONTCONFIG_PATH: '/dev/null',
+                FONTCONFIG_FILE: '/dev/null',
+            }
+        });
+        // If browser crashes, reset so next call relaunches
+        newBrowser.on('disconnected', () => {
+            console.warn("Browser disconnected, will relaunch on next request");
+            browser = null;
+            browserPromise = null;
+        });
+        browser = newBrowser;
+        browserPromise = null;
+        return browser;
+    })();
+    return browserPromise;
+}
+
+// Graceful shutdown
+process.on('SIGINT', async () => { if (browser) await browser.close(); process.exit(); });
+process.on('SIGTERM', async () => { if (browser) await browser.close(); process.exit(); });
+
+// ------------------------------------------------------------------
+// Markdown cache (5 min)
+// ------------------------------------------------------------------
+const markdownCache = new Map();
+
+// ------------------------------------------------------------------
+// Scrape a single URL – isolated context, crash recovery per page
+// ------------------------------------------------------------------
+async function scrapeWithPlaywright(url) {
+    const browserInstance = await getBrowser();
+    // Create a fresh context for isolation
+    const context = await browserInstance.newContext({
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        viewport: { width: 1280, height: 800 },
+        ignoreHTTPSErrors: true,
+    });
+    const page = await context.newPage();
+    try {
+        // Aggressive: shorter timeout, don't wait for full network idle
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+        const text = await page.evaluate(() => {
+            const clone = document.body.cloneNode(true);
+            const scripts = clone.querySelectorAll("script, style");
+            scripts.forEach(el => el.remove());
+            return clone.innerText || "";
+        });
+        const markdown = text.replace(/\n{3,}/g, "\n\n").trim();
+        if (!markdown || markdown.length < 100) return null;
+        return markdown;
+    } catch (err) {
+        console.error(`Playwright error for ${url}:`, err.message);
+        return null;  // fail fast, no retry
+    } finally {
+        await page.close().catch(() => { });
+        await context.close().catch(() => { });
+    }
+}
+
+async function fetchRawMarkdown(url) {
+    const now = Date.now();
+    const cached = markdownCache.get(url);
+    if (cached && (now - cached.timestamp) < 300000) {
+        return cached.markdown;
+    }
+    const markdown = await scrapeWithPlaywright(url);
+    if (markdown) {
+        markdownCache.set(url, { markdown, timestamp: now });
+    }
+    return markdown;
+}
+
+// ------------------------------------------------------------------
+// Process markdown (unchanged, but no title extraction change)
 // ------------------------------------------------------------------
 async function processMarkdown({ markdown, url, hostname, queryEmbedding }) {
     const cleanedText = markdown.replace(/\n{3,}/g, "\n\n").trim();
@@ -36,14 +149,22 @@ async function processMarkdown({ markdown, url, hostname, queryEmbedding }) {
     const chunks = await CreateChunks(cleanedText);
     if (!chunks || !chunks.length) return null;
 
+    let title = "";
+    const firstLine = markdown.split("\n")[0];
+    if (firstLine && firstLine.startsWith("# ")) title = firstLine.slice(2);
+    else if (firstLine) title = firstLine.slice(0, 100);
+    else title = url;
+
+    const prefixedChunks = chunks.map(chunk => `title: ${title || "none"} | text: ${chunk}`);
+
     const allEmbeddings = [];
-    const BATCH_SIZE = 12;
-    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-        const batch = chunks.slice(i, i + BATCH_SIZE);
+    const BATCH_SIZE = 24;
+    for (let i = 0; i < prefixedChunks.length; i += BATCH_SIZE) {
+        const batch = prefixedChunks.slice(i, i + BATCH_SIZE);
         const batchEmb = await EmbedChunk(batch);
         if (batchEmb && batchEmb.length) allEmbeddings.push(...batchEmb);
     }
-    if (allEmbeddings.length !== chunks.length) return null;
+    if (allEmbeddings.length !== prefixedChunks.length) return null;
 
     const scoredChunks = chunks.map((chunk, idx) => ({
         idx,
@@ -78,12 +199,6 @@ async function processMarkdown({ markdown, url, hostname, queryEmbedding }) {
 
     if (!finalContext) return null;
 
-    let title = "";
-    const firstLine = markdown.split("\n")[0];
-    if (firstLine && firstLine.startsWith("# ")) title = firstLine.slice(2);
-    else if (firstLine) title = firstLine.slice(0, 100);
-    else title = url;
-
     return {
         title,
         favicon: `https://www.google.com/s2/favicons?domain=${hostname}`,
@@ -94,26 +209,33 @@ async function processMarkdown({ markdown, url, hostname, queryEmbedding }) {
 }
 
 // ------------------------------------------------------------------
-// Scrape a single URL using Lightpanda fetch (direct markdown)
+// Concurrency – aggressive: higher limits, no delays, no robots.txt
 // ------------------------------------------------------------------
-async function scrapeUrl(url, queryEmbedding) {
-    const lightpandaBin = process.env.LIGHTPANDA_EXECUTABLE_PATH || "./lightpanda";
-    const command = `${lightpandaBin} fetch --dump markdown "${url}"`;
-    try {
-        const { stdout, stderr } = await execAsync(command, { timeout: 30000 });
-        if (stderr) console.warn(`Lightpanda fetch stderr for ${url}: ${stderr}`);
-        const markdown = stdout.trim();
-        if (!markdown || markdown.length < 100) return null;
-        const hostname = new URL(url).hostname;
-        return await processMarkdown({ markdown, url, hostname, queryEmbedding });
-    } catch (err) {
-        console.error(`Lightpanda fetch failed for ${url}:`, err.message);
-        return null;
+const domainLimiters = new Map();
+
+function getDomainLimiter(domain) {
+    if (!domainLimiters.has(domain)) {
+        domainLimiters.set(domain, pLimit(4)); // up to 4 concurrent per domain
     }
+    return domainLimiters.get(domain);
+}
+
+async function scrapeUrl(url, queryEmbedding) {
+    if (!isSafeUrl(url)) return null;
+    // Robots.txt check REMOVED (aggressive mode)
+    const markdown = await fetchRawMarkdown(url);
+    if (!markdown) return null;
+    const hostname = new URL(url).hostname;
+    return await processMarkdown({ markdown, url, hostname, queryEmbedding });
 }
 
 // ------------------------------------------------------------------
-// Main endpoint – now with concurrent scraping
+// Health check
+// ------------------------------------------------------------------
+app.get("/", (req, res) => res.send("Antinode Scrape API - AGGRESSIVE MODE (no robots.txt, no delays)"));
+
+// ------------------------------------------------------------------
+// Main endpoint – high concurrency
 // ------------------------------------------------------------------
 app.post("/api/search", async (req, res) => {
     const { source, prompt, user_id, message_id, webhook_url } = req.body;
@@ -131,7 +253,8 @@ app.post("/api/search", async (req, res) => {
     }
 
     try {
-        const queryEmbedding = await EmbedQuery(prompt);
+        const prefixedPrompt = `task: search result | query: ${prompt}`;
+        const queryEmbedding = await EmbedQuery(prefixedPrompt);
         if (!queryEmbedding || queryEmbedding.length === 0) {
             return res.status(500).json({ error: "Failed to embed query." });
         }
@@ -140,17 +263,20 @@ app.post("/api/search", async (req, res) => {
             await SendWebhook("Embedded your search query", "GENERATED_EMBEDDINGS", userId, messageId, webhook_url);
         }
 
-        // Concurrency limit – adjust based on your memory. 3 is safe for 512MB Render.
-        const concurrency = process.env.SCRAPE_CONCURRENCY ? parseInt(process.env.SCRAPE_CONCURRENCY) : 3;
-        const limit = pLimit(concurrency);
+        const globalConcurrency = parseInt(process.env.SCRAPE_CONCURRENCY) || 8; // higher
+        const globalLimiter = pLimit(globalConcurrency);
 
-        // Create an array of promises, each limited by pLimit
         const tasks = links.map(url =>
-            limit(async () => {
-                if (userId) {
-                    await SendWebhook(`Scraping: ${url}`, "FETCHING_URL", userId, messageId, webhook_url);
-                }
-                const result = await scrapeUrl(url, queryEmbedding);
+            globalLimiter(async () => {
+                const domain = new URL(url).hostname;
+                const domainLimiter = getDomainLimiter(domain);
+                const result = await domainLimiter(async () => {
+                    // No politeDelay
+                    if (userId) {
+                        await SendWebhook(`Scraping: ${url}`, "FETCHING_URL", userId, messageId, webhook_url);
+                    }
+                    return await scrapeUrl(url, queryEmbedding);
+                });
                 if (result && userId) {
                     await SendWebhook(result.markdown.slice(0, 500), "PAGE_READ", userId, messageId, webhook_url);
                 }
@@ -182,6 +308,7 @@ app.post("/api/search", async (req, res) => {
 // Start server
 // ------------------------------------------------------------------
 const PORT = process.env.PORT || 7860;
-app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Lightpanda fetch scraper running on port ${PORT}`);
+app.listen(PORT, "0.0.0.0", async () => {
+    await getBrowser(); // pre-launch
+    console.log(`🚀 AGGRESSIVE Playwright scraper running on port ${PORT}`);
 });

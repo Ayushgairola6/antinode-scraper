@@ -31,10 +31,10 @@ export async function EmbedChunk(chunk) {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                model: "mxbai-embed-large",
+                model: "embeddinggemma",
                 input: input,
             }),
-            signal: AbortSignal.timeout(8000_000),
+            signal: AbortSignal.timeout(120_000),
 
         });
 
@@ -81,6 +81,7 @@ export async function SendWebhook(link, message, user_id, MessageId, WEBHOOK_URL
         console.error("Webhook error:", error);
     }
 }
+
 
 // ------------------------------------------------------------------
 // Safe chunk creation

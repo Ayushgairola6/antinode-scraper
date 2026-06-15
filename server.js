@@ -86,7 +86,7 @@ const isJunkImg = url => /icon|logo|avatar|badge|pixel|track|spinner|button|arro
 // imageQuota = { used: number, max: number } — per-request, passed by ref
 // ─────────────────────────────────────────────────────────────────
 const VISION_PROMPT =
-    "Extract ALL key facts from this image. Include numbers, names, technical details, tables, charts, and every important data point. Respond in JSON format.";
+    "Extract ALL key facts from this image. Include numbers, names, technical details, tables, charts, and every important data point.Respond with an overview of the image.";
 
 async function analyzeImageFromUrl(imageUrl, imageQuota) {
     if (imageQuota.used >= imageQuota.max) return null; // quota exhausted for this request
@@ -101,22 +101,29 @@ async function analyzeImageFromUrl(imageUrl, imageQuota) {
 
         imageQuota.used++; // increment before the call so concurrent requests don't over-shoot
 
-        const res = await fetch(CFG.VISION_ENDPOINT, {
+        const res = await fetch("https://i-feel-eureka-vision.hf.space/v1/chat/completions", {
             method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${CFG.HF_TOKEN}` },
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${CFG.HF_TOKEN}`
+            },
             body: JSON.stringify({
-                model: "minicpm-v2.6",
+                model: "LiquidAI_LFM2-VL-450M-Q4_K_M",   // You might need to specify the model name
                 messages: [{
                     role: "user",
                     content: [
                         { type: "text", text: VISION_PROMPT },
-                        { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } },
-                    ],
+                        { type: "image_url", image_url: { url: `data:image/${mime};base64,${base64}` } }   // 👈 comma here
+                    ]
                 }],
-                max_tokens: 512, temperature: 0.2, stream: false,
+                temperature: 0.1,
+                min_p: 0.15,
+                repetition_penalty: 1.05,
+                max_tokens: 256,
             }),
-            signal: AbortSignal.timeout(30_000),
+            signal: AbortSignal.timeout(300000)
         });
+
 
         if (!res.ok) { console.warn(`Vision API ${res.status} for ${imageUrl}`); imageQuota.used--; return null; }
         const data = await res.json();
